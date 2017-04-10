@@ -30,6 +30,7 @@ int server_port;
 char *server_files_directory;
 char *server_proxy_hostname;
 int server_proxy_port;
+// pthread_t threads[num_threads];
 
 
 /*
@@ -43,6 +44,11 @@ int server_proxy_port;
  *      of files in the directory with links to each.
  *   4) Send a 404 Not Found response.
  */
+
+// Helper methods
+
+
+
 void handle_files_request(int fd) {
 
   /*
@@ -52,15 +58,125 @@ void handle_files_request(int fd) {
 
   struct http_request *request = http_request_parse(fd);
 
-  http_start_response(fd, 200);
-  http_send_header(fd, "Content-Type", "text/html");
-  http_end_headers(fd);
-  http_send_string(fd,
-      "<center>"
-      "<h1>Welcome to httpserver!</h1>"
-      "<hr>"
-      "<p>Nothing's here yet.</p>"
-      "</center>");
+
+  char fullPath[strlen(server_files_directory)+strlen(request -> path)];
+  strcpy(fullPath, server_files_directory);
+  strcat(fullPath, request -> path);
+  
+  struct stat targetFileStat;
+  int statResult = stat(fullPath, &targetFileStat);
+  if ((statResult == 0) && (S_ISDIR(targetFileStat.st_mode) != 0)) {
+      //handle directory
+    char slashPath[strlen(fullPath)+1];
+    strcpy(slashPath, fullPath);
+    if (slashPath[strlen(slashPath) != '/']) {strcat(slashPath, "/");}
+    char indexPath[strlen(slashPath)+strlen("index.html")];
+    strcpy(indexPath,slashPath);
+    strcat(indexPath, "index.html");
+    //Above is slightly complicated, but checks to see if the directory path has a trailing slash
+    if (access(indexPath, F_OK) != -1) {
+      //index file exists
+      FILE *targetFile = fopen(indexPath, "r");
+      if (targetFile) { //probably unnecessary?
+        fseek(targetFile, 0, SEEK_END);
+        size_t fileSize = ftell(targetFile);
+        rewind(targetFile);
+        char fileContents[fileSize];
+        fread(fileContents, 1, fileSize, targetFile);
+        //Now have file contents and size
+        http_start_response(fd, 200);
+        http_send_header(fd, "Content-Type", http_get_mime_type(indexPath));
+        http_send_header(fd, "Content-Length", (char *) &fileSize);
+        http_end_headers(fd);
+        http_send_data(fd, fileContents, fileSize);
+      }
+      else {
+        http_start_response(fd, 404);
+        http_end_headers(fd);
+      }
+      fclose(targetFile);
+    }
+    else {
+      /*index file doesn't exist, ick */
+      DIR *targetDirectory = opendir(fullPath);
+      struct dirent *targetOpened = readdir(targetDirectory);
+      FILE *tempIndex = fopen(indexPath,"a+"); //append, read
+      while (targetOpened != NULL) {
+        /*Following line is complicated+maybe unreliable, but writes a full link?
+        (may need \r\n?  Don't think so) */
+        fprintf(tempIndex, "<a href=\"%s%s\">%s</a>\n",slashPath,
+                targetOpened->d_name,
+                targetOpened->d_name);
+
+        // fputs(slashPath, tempIndex); fputs(targetOpened->d_name, tempIndex); fputc("\n", tempIndex);
+        targetOpened = readdir(targetDirectory);
+      }
+      fprintf(tempIndex, "<a href=\"../\">Parent directory</a>\n");
+
+      //get file size, read file into string, then send response
+      rewind(tempIndex);
+      fseek(tempIndex, 0, SEEK_END);
+      size_t fileSize = ftell(tempIndex);
+      rewind(tempIndex);
+      char fileContents[fileSize];
+      fread(fileContents, 1, fileSize, tempIndex);
+      //Now have file contents and size
+      http_start_response(fd, 200);
+      http_send_header(fd, "Content-Type", http_get_mime_type(indexPath));
+      http_send_header(fd, "Content-Length", (char *) &fileSize);
+      http_end_headers(fd);
+      http_send_data(fd, fileContents, fileSize);
+
+
+
+      closedir(targetDirectory);
+      fclose(tempIndex);
+    }
+  }
+  else {
+    if ((statResult == 0) && (S_ISREG(targetFileStat.st_mode) != 0)) {
+      //handle file
+      FILE *targetFile = fopen(fullPath, "r");
+      if (targetFile) {
+        fseek(targetFile, 0, SEEK_END);
+        size_t fileSize = ftell(targetFile);
+        rewind(targetFile);
+        char fileContents[fileSize];
+        fread(fileContents, 1, fileSize, targetFile);
+        //Now have file contents and size
+        char fileSizeChar = (char) fileSize;
+        http_start_response(fd, 200);
+        http_send_header(fd, "Content-Type", http_get_mime_type(fullPath));
+        http_send_header(fd, "Content-Length", &fileSizeChar);
+        http_end_headers(fd);
+        http_send_data(fd, fileContents, fileSize);
+      }
+      else {
+        http_start_response(fd, 404);
+        http_end_headers(fd);
+      }
+      fclose(targetFile);
+
+    }
+    else {
+      //error, couldn't find file
+      http_start_response(fd, 404);
+      http_end_headers(fd);
+    }
+  }
+
+
+
+
+  // http_start_response(fd, 200);
+  // http_send_header(fd, "Content-Type", "text/html");
+  // http_end_headers(fd);
+  // http_send_string(fd,
+  //     "<center>"
+  //     "<h1>Welcome to httpserver!</h1>"
+  //     "<hr>"
+  //     "<p>Nothing's here yet.</p>"
+  //     "</center>");
 }
 
 
@@ -124,11 +240,34 @@ void handle_proxy_request(int fd) {
 }
 
 
-void init_thread_pool(int num_threads, void (*request_handler)(int)) {
+
+void worker_queue(void *t) {
+  //I'm a tad iffy about the following line
+  void (*request_handler)(int) = t;
+  int currSocket;
+  while (1) {
+    // Might need to impove this section?  Do I need to acquire the lock every time?
+    pthread_mutex_lock(&(work_queue.wq_empty_mutex));
+    currSocket = wq_pop(&work_queue);
+    request_handler(currSocket);
+    // t(currSocket);
+
+    close(currSocket);
+  }
+}
+
+
+void init_thread_pool(int num_threads, pthread_t *threads, void (*request_handler)(int)) {
   /*
    * TODO: Part of your solution for Task 2 goes here!
    */
+   wq_init(&work_queue);
+   int i;
+   for (i = 0; i < num_threads; i += 1) {
+      pthread_create(&threads[i], NULL, worker_queue, request_handler);
+   }
 }
+
 
 /*
  * Opens a TCP stream socket on all interfaces with port number PORTNO. Saves
@@ -172,7 +311,8 @@ void serve_forever(int *socket_number, void (*request_handler)(int)) {
 
   printf("Listening on port %d...\n", server_port);
 
-  init_thread_pool(num_threads, request_handler);
+  pthread_t threads[num_threads];
+  init_thread_pool(num_threads, threads, request_handler);
 
   while (1) {
     client_socket_number = accept(*socket_number,
@@ -188,8 +328,11 @@ void serve_forever(int *socket_number, void (*request_handler)(int)) {
         client_address.sin_port);
 
     // TODO: Change me?
-    request_handler(client_socket_number);
-    close(client_socket_number);
+
+    // request_handler(client_socket_number);
+    // close(client_socket_number);
+
+    wq_push(&work_queue, client_socket_number);
 
     printf("Accepted connection from %s on port %d\n",
         inet_ntoa(client_address.sin_addr),
